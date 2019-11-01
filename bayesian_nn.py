@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import torch.utils.data as data_utils
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
+# from torch.distributions.normal import Normal
+from pyro.distributions import Normal
 from tqdm import tqdm
 import shutil
 
@@ -22,6 +24,11 @@ from utils import count_parameters, accuracy
 
 from config import NUM_EPOCHS
 from callbacks import Hook
+
+import pyro
+import pyro.distributions as dist
+from pyro.infer import SVI, Trace_ELBO, TraceEnum_ELBO, config_enumerate
+from pyro.optim import Adam
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 status_properties = ['loss', 'accuracy']
@@ -163,7 +170,7 @@ class Net(nn.Module):
         x_sz = enc_szs[len(enc_szs) - 1]
         head = FeedForward(x_sz)
         layers = [encoder, head]
-        [print(count_parameters(x)) for x in layers]
+        # [print(count_parameters(x)) for x in layers]
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -182,14 +189,29 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 
 #######################################################################################
 
+def normal(*shape):
+    loc = torch.zeros(*shape)
+    scale = torch.ones(*shape)
+    dist = Normal(loc, scale)
+    return dist
+
+def variable_normal(name, *shape):
+    l = torch.empty(*shape, requires_grad=True)
+    s = torch.empty(*shape, requires_grad=True)
+    torch.nn.init.normal_(l, std=0.01)
+    torch.nn.init.normal_(s, std=0.01)
+    loc = pyro.param(name+"_loc", l)
+    scale = F.softplus(pyro.param(name+"_scale", s))
+    return Normal(loc, scale)
+
 class BaseLearner():
     '''Training loop'''
     def __init__(self, epochs=NUM_EPOCHS):
-        self.model = Net()
+        self.encoder = Net()
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=5e-2, weight_decay=1e-6)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10, eta_min=1e-3)
+        self.optimizer = Adam({'lr': 0.01})
         self.epochs = epochs
+        self.svi = SVI(model=self.model, guide=self.guide, optim=self.optimizer, loss=Trace_ELBO())
 
         self.train_loader = torch.load('train_loader.pt')
         self.cv_loader = torch.load('cv_loader.pt')
@@ -198,59 +220,65 @@ class BaseLearner():
         self.cv_loss = []
 
         self.best_loss = 1e3
-        print('Model Parameters: ', count_parameters(self.model))
+        # print('Model Parameters: ', count_parameters(self.model))
 
-    def iterate(self, loader, model, criterion, optimizer, training=True):
-        if training:
-            model.train()
-        else:
-            model.eval()
+    def model(self, inputs, targets):
+        priors = {}
+        for module in self.encoder.children():
+            for param, data in module.named_parameters():
+                if '.bn.' in param:
+                    continue
+                priors[param] = normal(data.shape)
+        lifted_module = pyro.random_module("encoder", self.encoder, priors)
+        lifted_reg_model = lifted_module()
+        preds = F.log_softmax(lifted_reg_model(inputs))
+        pyro.sample("obs", Categorical(logits=preds), obs=targets)
+
+    def guide(self, inputs, targets):
+        dists = {}
+        for module in self.encoder.children():
+            for param, data in module.named_parameters():
+                if '.bn.' in param:
+                    continue
+                dists[param] = variable_normal(param, data.shape)
+        lifted_module = pyro.random_module("encoder", self.encoder, dists)
+        return lifted_module
+
+    def iterate(self, loader):
         props = {k:0 for k in status_properties}
         for i, data in enumerate(loader):
-            if i % 100 == 0:
-                print(i)
             x, targets = data
-            targets = targets.view(-1).to(device)
-            preds = model(x.to(device))
-            loss = criterion(preds, targets)
+            import pdb; pdb.set_trace()
+            loss = self.svi.step(x.to(device), targets.to(device))
             props['loss'] += loss.item()
-            props['accuracy'] += accuracy(preds, targets).item()
-            if training:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                clip_grad_norm_(model.parameters(), 0.5)
-            L = len(loader)
+        L = len(loader)
         props = {k:v/L for k,v in props.items()}
         return props
+
+    def predict(self, x, num_samples=10):
+        sampled_models = [self.guide(None, None) for _ in range(num_samples)]
+        yhats = [model(x).data for model in sampled_models]
+        import pdb; pdb.set_trace()
+        mean = torch.mean(torch.stack(yhats), 0)
+        return np.argmax(mean, axis=1)
 
     def step(self):
         '''Actual training loop.'''
         for epoch in tqdm(range(self.epochs)):
-            train_props = self.iterate(self.train_loader, self.model, self.criterion, self.optimizer, training=True)
-            self.scheduler.step(epoch)
-            lr = self.scheduler.get_lr()[0]
-            self.train_loss.append(train_props['loss'])
-            # cross validation
-            with torch.no_grad():
-                cv_props = self.iterate(self.cv_loader, self.model, self.criterion, self.optimizer, training=False)
-                L = len(self.cv_loader)
-                self.cv_loss.append(cv_props['loss'])
-                if epoch % 1 == 0:
-                    self.status(epoch, train_props, cv_props)
-                if cv_props['loss'] < self.best_loss:
-                    print('dumping model...')
-                    path = 'model' + '.pt'
-                    torch.save(self.model, path)
-                    self.best_loss = cv_props['loss']
-                    is_best = True
-                save_checkpoint(
-                    {'epoch': epoch + 1,
-                    'lr': lr, 
-                    'state_dict': self.model.state_dict(), 
-                    'optimizer': self.optimizer.state_dict(), 
-                    'best_loss': self.best_loss}, is_best=is_best)
-                is_best=False
+            train_props = self.iterate(self.train_loader)
+            total = 0
+            cv_props = {}
+            cv_props['accuracy'] = 0
+            for j, data in enumerate(self.cv_loader):
+                x, targets = data
+                x.to(device)
+                targets.to(device)
+                preds = self.predict(x)
+                total += targets.size(0)
+                cv_props['accuracy'] += accuracy(preds, targets)
+            L = len(cv_loader)
+            cv_props = {k:v/L for k,v in cv_props.items()}
+            self.status(epoch, train_props, cv_props)
 
     def status(self, epoch, train_props, cv_props):
         s0 = 'epoch {0}/{1}\n'.format(epoch, self.epochs)
