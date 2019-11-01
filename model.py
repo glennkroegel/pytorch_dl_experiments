@@ -234,14 +234,14 @@ class BaseLearner():
             with torch.no_grad():
                 cv_props = self.iterate(self.cv_loader, self.model, self.criterion, self.optimizer, training=False)
                 L = len(self.cv_loader)
-                self.cv_loss.append(props['loss'])
+                self.cv_loss.append(cv_props['loss'])
                 if epoch % 1 == 0:
                     self.status(epoch, train_props, cv_props)
-                if props['loss'] < self.best_loss:
+                if cv_props['loss'] < self.best_loss:
                     print('dumping model...')
                     path = 'model' + '.pt'
                     torch.save(self.model, path)
-                    self.best_loss = props['loss']
+                    self.best_loss = cv_props['loss']
                     is_best = True
                 save_checkpoint(
                     {'epoch': epoch + 1,
