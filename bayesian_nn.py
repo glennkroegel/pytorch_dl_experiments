@@ -206,16 +206,27 @@ class TestEncoder(nn.Module):
     def __init__(self):
         super(TestEncoder, self).__init__()
         self.conv = ConvNet()
-        self.fc = FeedForward((1,40))
-        self.act = nn.LeakyReLU()
+        self.fc = FeedForward(torch.Size([1,10,2,2]))
 
     def forward(self, x):
-        x = x
         bs = x.size(0)
         x = x.unsqueeze(1)
         x = self.conv(x)
+        x = self.fc(x)
+        return x
+
+class BasicEncoder(nn.Module):
+    def __init__(self):
+        super(BasicEncoder, self).__init__()
+        self.fc1 = nn.Linear(28*28, 20)
+        self.fc2 = nn.Linear(20, 10)
+        self.act = nn.LeakyReLU()
+
+    def forward(self, x):
+        bs = x.size(0)
         x = x.view(bs, -1)
-        x = self.act(self.fc(x))
+        x = self.act(self.fc1(x))
+        x = self.fc2(x)
         return x
 
 ###########################################################################
@@ -242,10 +253,54 @@ def variable_normal(name, *shape):
     scale = F.softplus(pyro.param(name+"_scale", s))
     return Normal(loc, scale)
 
+#######################################################################################
+
+class Classifier(nn.Module):
+    def __init__(self):
+        super(Classifier, self).__init__()
+        self.encoder = BasicEncoder()
+        self.softplus = nn.Softplus()
+
+    def model(self, inputs, targets):
+        priors = {}
+        # for module in self.encoder.modules():
+        for param, data in self.encoder.named_parameters():
+            if '.bn.' in param:
+                continue
+            if 'weight' in param or 'bias' in param:
+                priors[param] = normal(data.shape)
+        # import pdb; pdb.set_trace()
+        lifted_module = pyro.random_module("encoder", self.encoder, priors)
+        lifted_reg_model = lifted_module()
+        preds = F.log_softmax(lifted_reg_model(inputs), dim=-1)
+        pyro.sample("obs", Categorical(logits=preds).to_event(1), obs=targets)
+
+    def guide(self, inputs, targets):
+        dists = {}
+        # for module in self.encoder.modules():
+        for param, data in self.encoder.named_parameters():
+            if '.bn.' in param:
+                continue
+            if 'weight' in param or 'bias' in param:
+                dists[param] = variable_normal(param, data.shape)
+        lifted_module = pyro.random_module("encoder", self.encoder, dists)
+        return lifted_module
+
+    def predict(self, x, num_samples=10):
+        sampled_models = [self.guide(None, None) for _ in range(num_samples)]
+        preds = [model()(x) for model in sampled_models]
+        preds = torch.stack(preds, dim=2)
+        mean = torch.mean(preds, dim=2)
+        # std = torch.std(preds)
+        # return torch.argmax(mean, dim=-1)
+        return mean
+
+#######################################################################################
+
 class BaseLearner():
     '''Training loop'''
     def __init__(self, epochs=NUM_EPOCHS):
-        self.encoder = Net()#TestEncoder()
+        self.encoder = BasicEncoder()
         self.optimizer = SGD({'lr': 0.001})
         self.epochs = epochs
         self.svi = SVI(model=self.model, guide=self.guide, optim=self.optimizer, loss=Trace_ELBO())
@@ -265,11 +320,13 @@ class BaseLearner():
         for param, data in self.encoder.named_parameters():
             if '.bn.' in param:
                 continue
-            priors[param] = normal(data.shape)
+            if 'weight' in param or 'bias' in param:
+                priors[param] = normal(data.shape)
+        # import pdb; pdb.set_trace()
         lifted_module = pyro.random_module("encoder", self.encoder, priors)
         lifted_reg_model = lifted_module()
         preds = F.log_softmax(lifted_reg_model(inputs), dim=-1)
-        pyro.sample("obs", Categorical(logits=preds), obs=targets)
+        pyro.sample("obs", Categorical(logits=preds).to_event(1), obs=targets)
 
     def guide(self, inputs, targets):
         dists = {}
@@ -277,7 +334,8 @@ class BaseLearner():
         for param, data in self.encoder.named_parameters():
             if '.bn.' in param:
                 continue
-            dists[param] = variable_normal(param, data.shape)
+            if 'weight' in param or 'bias' in param:
+                dists[param] = variable_normal(param, data.shape)
         lifted_module = pyro.random_module("encoder", self.encoder, dists)
         return lifted_module
 
@@ -327,10 +385,45 @@ class BaseLearner():
             s2 = s2 + 'cv_'+ k + ': ' + str(v) + ' '
         print(s0 + s1 + s2)
 
+def status(epoch, train_props, cv_props):
+    s0 = 'epoch {0}/{1}\n'.format(epoch, NUM_EPOCHS)
+    s1, s2 = '',''
+    for k,v in train_props.items():
+        s1 = s1 + 'train_'+ k + ': ' + str(v) + ' '
+    for k,v in cv_props.items():
+        s2 = s2 + 'cv_'+ k + ': ' + str(v) + ' '
+    print(s0 + s1 + s2)
+
 if __name__ == "__main__":
     try:
-        mdl = BaseLearner()
-        mdl.step()
+        # mdl = BaseLearner()
+        # mdl.step()
+        clf = Classifier()
+        svi = SVI(model=clf.model, guide=clf.guide, optim=Adam({"lr": 1000}), loss=Trace_ELBO())
+        
+        train_loader = torch.load('train_loader.pt')
+        cv_loader = torch.load('cv_loader.pt')
+        epochs = NUM_EPOCHS
+        for epoch in tqdm(range(epochs)):
+            train_props = {k:0 for k in status_properties}
+            for i, data in enumerate(train_loader):
+                x, targets = data
+                loss = svi.step(x.to(device), targets.to(device))
+                train_props['loss'] += loss
+            L = len(train_loader)
+            train_props = {k:v/L for k,v in train_props.items()}
+
+            cv_props = {k:0 for k in status_properties}
+            for j, data in enumerate(cv_loader):
+                x, targets = data
+                x.to(device)
+                targets.to(device)
+                preds = clf.predict(x)
+                cv_props['loss'] += svi.evaluate_loss(x, targets)
+                cv_props['accuracy'] += accuracy(preds, targets)
+            L = len(cv_loader)
+            cv_props = {k:v/L for k,v in cv_props.items()}
+            status(epoch, train_props, cv_props)
     except KeyboardInterrupt:
         pd.to_pickle(mdl.train_loss, 'train_loss.pkl')
         pd.to_pickle(mdl.cv_loss, 'cv_loss.pkl')
