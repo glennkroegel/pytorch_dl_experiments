@@ -36,8 +36,9 @@ def to_gpu(x, *args, **kwargs):
 def accuracy(input, targs):
     "Compute accuracy with `targs` when `input` is bs * n_classes."
     n = targs.shape[0]
-    input = input.argmax(dim=-1).view(n,-1)
-    targs = targs.view(n,-1)
+    if len(input.shape) > 1:    
+        input = input.argmax(dim=-1).view(n,-1)
+        targs = targs.view(n,-1)
     return (input==targs).float().mean()
 
 def bce_acc(input, targs):
