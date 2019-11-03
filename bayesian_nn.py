@@ -36,6 +36,7 @@ status_properties = ['loss', 'accuracy']
 # https://alsibahi.xyz/snippets/2019/06/15/pyro_mnist_bnn_kl.html
 # https://forum.pyro.ai/t/mini-batch-training-of-svi-models/895/8
 # https://github.com/paraschopra/bayesian-neural-network-mnist/blob/master/bnn.ipynb
+# checkpointing: https://pyro.ai/examples/dmm.html
 
 #############################################################################################################################
 
@@ -303,6 +304,12 @@ class Classifier(nn.Module):
         # std = torch.std(preds)
         # return torch.argmax(mean, dim=-1)
         return mean
+
+    def sample(self, x, num_samples=100):
+        sampled_models = [self.guide(None, None) for _ in range(num_samples)]
+        preds = [model(x.to(device)) for model in sampled_models]
+        preds = torch.stack(preds, dim=2)
+        return preds
 
 #######################################################################################
 
