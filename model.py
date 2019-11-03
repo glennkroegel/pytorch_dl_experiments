@@ -176,8 +176,8 @@ class Net(nn.Module):
 class BasicEncoder(nn.Module):
     def __init__(self):
         super(BasicEncoder, self).__init__()
-        self.fc1 = nn.Linear(28*28, 200, bias=False)
-        self.fc2 = nn.Linear(200, 10, bias=False)
+        self.fc1 = nn.Linear(28*28, 20, bias=False)
+        self.fc2 = nn.Linear(20, 10, bias=False)
         self.act = nn.LeakyReLU()
 
     def forward(self, x):

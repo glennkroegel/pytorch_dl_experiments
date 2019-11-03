@@ -222,8 +222,8 @@ class TestEncoder(nn.Module):
 class BasicEncoder(nn.Module):
     def __init__(self):
         super(BasicEncoder, self).__init__()
-        self.fc1 = nn.Linear(28*28, 200, bias=False)
-        self.fc2 = nn.Linear(200, 10, bias=False)
+        self.fc1 = nn.Linear(28*28, 20, bias=False)
+        self.fc2 = nn.Linear(20, 10, bias=False)
         self.act = nn.LeakyReLU()
 
     def forward(self, x):
@@ -260,11 +260,11 @@ def variable_normal(name, *shape):
 #######################################################################################
 
 class Classifier(nn.Module):
-    def __init__(self, use_cuda=True):
+    def __init__(self, use_cuda=False):
         super(Classifier, self).__init__()
-        # d = torch.load('checkpoint.pth.tar')
+        d = torch.load('model_best.pth.tar')
         self.encoder = BasicEncoder()
-        # self.encoder.load_state_dict(d['state_dict'])
+        self.encoder.load_state_dict(d['state_dict'])
         self.log_softmax = nn.LogSoftmax(dim=1)
         self.use_cuda = use_cuda
 
@@ -274,7 +274,6 @@ class Classifier(nn.Module):
     def model(self, inputs, targets):
         bs = targets.size(0)
         priors = {}
-        # for module in self.encoder.modules():
         for param, data in self.encoder.named_parameters():
             if '.bn.' in param:
                 continue
@@ -282,25 +281,23 @@ class Classifier(nn.Module):
                 priors[param] = normal(data.shape).to_event(1)
         lifted_module = pyro.random_module("encoder", self.encoder, priors)
         lifted_reg_model = lifted_module()
-        preds = self.log_softmax(lifted_reg_model(inputs))
-        with pyro.plate("data", size=bs):
+        with pyro.plate("data", bs):
+            preds = self.log_softmax(lifted_reg_model(inputs))
             pyro.sample("obs", Categorical(logits=preds).independent(1), obs=targets)
 
     def guide(self, inputs, targets):
-        # bs = targets.size(0)
         dists = {}
-        # for module in self.encoder.modules():
         for param, data in self.encoder.named_parameters():
             if '.bn.' in param:
                 continue
             if 'weight' in param or 'bias' in param:
                 dists[param] = variable_normal(param, data.shape)
         lifted_module = pyro.random_module("encoder", self.encoder, dists)
-        return lifted_module
+        return lifted_module()
 
     def predict(self, x, num_samples=10):
         sampled_models = [self.guide(None, None) for _ in range(num_samples)]
-        preds = [model()(x.to(device)) for model in sampled_models]
+        preds = [model(x.to(device)) for model in sampled_models]
         preds = torch.stack(preds, dim=2)
         mean = torch.mean(preds, dim=2)
         # std = torch.std(preds)
