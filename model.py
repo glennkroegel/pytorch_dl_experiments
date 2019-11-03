@@ -173,6 +173,20 @@ class Net(nn.Module):
         x = x.view(bs, 10)
         return x 
 
+class BasicEncoder(nn.Module):
+    def __init__(self):
+        super(BasicEncoder, self).__init__()
+        self.fc1 = nn.Linear(28*28, 200, bias=False)
+        self.fc2 = nn.Linear(200, 10, bias=False)
+        self.act = nn.LeakyReLU()
+
+    def forward(self, x):
+        bs = x.size(0)
+        x = x.view(bs, -1)
+        x = self.act(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
 ###########################################################################
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -185,7 +199,7 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 class BaseLearner():
     '''Training loop'''
     def __init__(self, epochs=NUM_EPOCHS):
-        self.model = Net()
+        self.model = BasicEncoder().to(device)
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=5e-2, weight_decay=1e-6)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10, eta_min=1e-3)

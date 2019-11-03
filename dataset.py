@@ -28,7 +28,7 @@ class ProcessedDataLoaderFactory():
     def gen(self, batch_size=256):
         train_set = ProcessedDataset(self.train_data)
         cv_set = ProcessedDataset(self.cv_data)
-        train_loader = DataLoader(train_set, batch_size=batch_size)
-        cv_loader = DataLoader(cv_set, batch_size=batch_size)
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, pin_memory=False)
+        cv_loader = DataLoader(cv_set, batch_size=batch_size, shuffle=True, pin_memory=False)
         torch.save(train_loader, 'train_loader.pt')
         torch.save(cv_loader, 'cv_loader.pt')

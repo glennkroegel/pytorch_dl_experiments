@@ -15,7 +15,6 @@ import torch.utils.data as data_utils
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 # from torch.distributions.normal import Normal
-from pyro.distributions import Normal, Categorical
 from tqdm import tqdm
 import shutil
 
@@ -27,11 +26,16 @@ from callbacks import Hook
 
 import pyro
 import pyro.distributions as dist
+from pyro.distributions import Normal, Categorical
 from pyro.infer import SVI, Trace_ELBO, TraceEnum_ELBO, config_enumerate
-from pyro.optim import Adam, SGD
+from pyro.optim import Adam, ClippedAdam
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 status_properties = ['loss', 'accuracy']
+
+# https://alsibahi.xyz/snippets/2019/06/15/pyro_mnist_bnn_kl.html
+# https://forum.pyro.ai/t/mini-batch-training-of-svi-models/895/8
+# https://github.com/paraschopra/bayesian-neural-network-mnist/blob/master/bnn.ipynb
 
 #############################################################################################################################
 
@@ -218,8 +222,8 @@ class TestEncoder(nn.Module):
 class BasicEncoder(nn.Module):
     def __init__(self):
         super(BasicEncoder, self).__init__()
-        self.fc1 = nn.Linear(28*28, 20)
-        self.fc2 = nn.Linear(20, 10)
+        self.fc1 = nn.Linear(28*28, 200, bias=False)
+        self.fc2 = nn.Linear(200, 10, bias=False)
         self.act = nn.LeakyReLU()
 
     def forward(self, x):
@@ -241,14 +245,14 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 def normal(*shape):
     loc = torch.zeros(*shape).to(device)
     scale = torch.ones(*shape).to(device)
-    dist = Normal(loc, scale)
+    dist = Normal(loc, scale).independent(1)
     return dist
 
 def variable_normal(name, *shape):
     l = torch.empty(*shape, requires_grad=True, device=device)
     s = torch.empty(*shape, requires_grad=True, device=device)
-    torch.nn.init.normal_(l, std=0.01)
-    torch.nn.init.normal_(s, std=0.01)
+    torch.nn.init.normal_(l, mean=0, std=0.01)
+    torch.nn.init.normal_(s, mean=0, std=0.01)
     loc = pyro.param(name+"_loc", l)
     scale = F.softplus(pyro.param(name+"_scale", s))
     return Normal(loc, scale)
@@ -256,26 +260,34 @@ def variable_normal(name, *shape):
 #######################################################################################
 
 class Classifier(nn.Module):
-    def __init__(self):
+    def __init__(self, use_cuda=True):
         super(Classifier, self).__init__()
+        # d = torch.load('checkpoint.pth.tar')
         self.encoder = BasicEncoder()
-        self.softplus = nn.Softplus()
+        # self.encoder.load_state_dict(d['state_dict'])
+        self.log_softmax = nn.LogSoftmax(dim=1)
+        self.use_cuda = use_cuda
+
+        if self.use_cuda:
+            self.cuda()
 
     def model(self, inputs, targets):
+        bs = targets.size(0)
         priors = {}
         # for module in self.encoder.modules():
         for param, data in self.encoder.named_parameters():
             if '.bn.' in param:
                 continue
             if 'weight' in param or 'bias' in param:
-                priors[param] = normal(data.shape)
-        # import pdb; pdb.set_trace()
+                priors[param] = normal(data.shape).to_event(1)
         lifted_module = pyro.random_module("encoder", self.encoder, priors)
         lifted_reg_model = lifted_module()
-        preds = F.log_softmax(lifted_reg_model(inputs), dim=-1)
-        pyro.sample("obs", Categorical(logits=preds).to_event(1), obs=targets)
+        preds = self.log_softmax(lifted_reg_model(inputs))
+        with pyro.plate("data", size=bs):
+            pyro.sample("obs", Categorical(logits=preds).independent(1), obs=targets)
 
     def guide(self, inputs, targets):
+        # bs = targets.size(0)
         dists = {}
         # for module in self.encoder.modules():
         for param, data in self.encoder.named_parameters():
@@ -288,7 +300,7 @@ class Classifier(nn.Module):
 
     def predict(self, x, num_samples=10):
         sampled_models = [self.guide(None, None) for _ in range(num_samples)]
-        preds = [model()(x) for model in sampled_models]
+        preds = [model()(x.to(device)) for model in sampled_models]
         preds = torch.stack(preds, dim=2)
         mean = torch.mean(preds, dim=2)
         # std = torch.std(preds)
@@ -398,16 +410,19 @@ if __name__ == "__main__":
     try:
         # mdl = BaseLearner()
         # mdl.step()
+        pyro.clear_param_store()
         clf = Classifier()
-        svi = SVI(model=clf.model, guide=clf.guide, optim=Adam({"lr": 1000}), loss=Trace_ELBO())
+        svi = SVI(model=clf.model, guide=clf.guide, optim=ClippedAdam({"lr": 0.01, "clip_norm": 0.25}), loss=Trace_ELBO())
         
         train_loader = torch.load('train_loader.pt')
         cv_loader = torch.load('cv_loader.pt')
         epochs = NUM_EPOCHS
+        num_iter = 5
         for epoch in tqdm(range(epochs)):
             train_props = {k:0 for k in status_properties}
             for i, data in enumerate(train_loader):
                 x, targets = data
+                targets = targets.view(-1)
                 loss = svi.step(x.to(device), targets.to(device))
                 train_props['loss'] += loss
             L = len(train_loader)
@@ -416,11 +431,12 @@ if __name__ == "__main__":
             cv_props = {k:0 for k in status_properties}
             for j, data in enumerate(cv_loader):
                 x, targets = data
+                targets = targets.view(-1)
                 x.to(device)
                 targets.to(device)
                 preds = clf.predict(x)
-                cv_props['loss'] += svi.evaluate_loss(x, targets)
-                cv_props['accuracy'] += accuracy(preds, targets)
+                cv_props['loss'] += svi.evaluate_loss(x.to(device), targets.to(device))
+                cv_props['accuracy'] += accuracy(preds.to(device), targets.to(device))
             L = len(cv_loader)
             cv_props = {k:v/L for k,v in cv_props.items()}
             status(epoch, train_props, cv_props)
