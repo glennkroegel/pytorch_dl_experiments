@@ -173,6 +173,29 @@ class Net(nn.Module):
         x = x.view(bs, 10)
         return x 
 
+class SimpleEncoder(nn.Module):
+    def __init__(self):
+        super(SimpleEncoder, self).__init__()
+        # self.szs = [28, 3]
+        # self.conv1 = Conv(in_c = 1, out_c=10, ks=5)
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=10, kernel_size=3, bias=False)
+        self.pool1 = nn.AdaptiveMaxPool2d(3)
+        self.act = nn.LeakyReLU()
+        self.fc = nn.Linear(90, 20, bias=False)
+        self.l_out = nn.Linear(20, 10, bias=False)
+
+    def forward(self, x):
+        x = x
+        bs = x.size(0)
+        x = x.unsqueeze(1)
+        x = self.act(self.conv1(x))
+        x = self.pool1(x)
+        import pdb; pdb.set_trace()
+        x = x.view(bs, -1)
+        x = self.act(self.fc(x))
+        x = self.l_out(x)
+        return x
+
 class BasicEncoder(nn.Module):
     def __init__(self):
         super(BasicEncoder, self).__init__()
@@ -199,7 +222,7 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 class BaseLearner():
     '''Training loop'''
     def __init__(self, epochs=NUM_EPOCHS):
-        self.model = BasicEncoder().to(device)
+        self.model = SimpleEncoder().to(device)
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=5e-2, weight_decay=1e-6)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10, eta_min=1e-3)
