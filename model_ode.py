@@ -1,6 +1,6 @@
 '''
 created_by: Glenn Kroegel
-date: 2 August 2019
+date: 11 November 2019
 
 '''
 
@@ -15,6 +15,7 @@ import torch.utils.data as data_utils
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 import torchvision
+from torchdiffeq import odeint
 from tqdm import tqdm
 import shutil
 
@@ -27,26 +28,11 @@ from callbacks import Hook
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 status_properties = ['loss', 'accuracy']
 
-#############################################################################################################################
-
-insize = (1, 1, 28, 28)
-def get_hooks(m):
-    # md = {k:v for k,v in m._modules.items()}
-    md = {k:v[1] for k,v in enumerate(m._modules.items())}
-    hooks = {k: Hook(layer) for k, layer in md.items()}
-    x = torch.randn(insize).requires_grad_(False)
-    m.eval()(x)
-    out_szs = {k:h.output.shape for k,h in hooks.items()}
-    inp_szs = {k:h.input[0].shape for k,h in hooks.items()}
-    return hooks, inp_szs, out_szs
-
-#############################################################################################################################
-
 class Dense(nn.Module):
     def __init__(self, in_size, out_size, bias=False):
         super(Dense, self).__init__()
         self.fc = nn.Linear(in_size, out_size, bias=bias)
-        self.bn = nn.BatchNorm1d(out_size)
+        self.norm = nn.BatchNorm1d(out_size)
         self.drop = nn.Dropout(0.1)
         self.act = nn.LeakyReLU()
         self.in_size = in_size
@@ -54,7 +40,7 @@ class Dense(nn.Module):
 
     def forward(self, x):
         x = x.view(-1, self.in_size)
-        x = self.bn(self.drop(self.act(self.fc(x))))
+        x = self.act(self.bn(self.fc(x)))
         return x
 
 class Conv(nn.Module):
@@ -92,62 +78,32 @@ class ConvResBlock(nn.Module):
         x = self.res_block(x)
         return x
 
-#############################################################################################################################
+class Convxt(nn.Module):
+    def __init__(self, in_c, out_c, ks=3, stride=1, padding=1, bias=False):
+        super(Convxt, self).__init__()
+        self.conv = nn.Conv2d(in_channels=in_c + 1, out_channels=out_c, kernel_size=ks, stride=stride, bias=bias, padding=padding)
+        self.norm = nn.GroupNorm(min(out_c, out_c), out_c)
+        self.drop = nn.Dropout(0.1)
+        self.act = nn.LeakyReLU()
+        self.in_size = in_c
+        self.out_size = out_c
 
-class ResNet(nn.Module):
-    def __init__(self):
-        super(ResNet, self).__init__()
-        resnet = torchvision.models.resnet18(pretrained=True)
-        self.clf = nn.Sequential(*[x for x in resnet.children()][:-2])
-        self.clf.requires_grad_(False)
-
-    def forward(self, x):
-        x = self.clf(x)
-        return x
-
-class CustomHead(nn.Module):
-    def __init__(self, in_shp, out_c=4):
-        super(CustomHead, self).__init__()
-        in_c = in_shp[1]
-        self.conv = Conv(in_c, 64)
-        self.conv2 = Conv(64, out_c)
-        self.pool = nn.AdaptiveMaxPool2d(3)
-        self.fc = Dense(36, 10)
-        self.out = nn.Linear(10, 4)
-
-    def forward(self, x):
-        bs = x.size(0)
-        x = self.conv2(self.conv(x))
-        x = self.pool(x)
-        x = x.view(bs, -1)
-        x = self.fc(x)
-        x = self.out(x)
+    def forward(self, t, x):
+        tt = torch.ones_like(x[:, :1, :, :]) * t
+        xtt = torch.cat([tt, x], dim=1)
+        y = self.norm(self.conv(xtt))
+        y = self.act(y)
         return x
 
 #############################################################################################################################
-
-class ConvNet(nn.Module):
-    def __init__(self):
-        super(ConvNet, self).__init__()
-        c = 10
-        self.norm = nn.LayerNorm((1,28,28))
-        self.downsample = nn.Sequential(ConvResBlock(1,c),
-                                        ConvResBlock(c, c), 
-                                        ConvResBlock(c, c), 
-                                        ConvResBlock(c, c))
-    def forward(self, x):
-        bs = x.size(0)
-        # x = self.norm(x)
-        x = self.downsample(x)
-        return x
 
 class FeedForward(nn.Module):
     def __init__(self, in_shp):
         super(FeedForward, self).__init__()
         self.in_shp = in_shp
         in_feats = in_shp[1]*in_shp[2]*in_shp[3]
-        self.fc = Dense(in_feats, 10)
-        self.out = nn.Linear(10, 10)
+        self.fc = Dense(in_feats, 20)
+        self.out = nn.Linear(20, 10)
 
     def forward(self, x):
         bs = x.size(0)
@@ -158,28 +114,28 @@ class FeedForward(nn.Module):
 
 #############################################################################################################################
 
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        encoder = ConvNet()
-        hooks, inp_szs, enc_szs = get_hooks(encoder.downsample)
-        idxs = list(enc_szs.keys())
-        x_sz = enc_szs[len(enc_szs) - 1]
-        head = FeedForward(x_sz)
-        layers = [encoder, head]
-        [print(count_parameters(x)) for x in layers]
-        self.layers = nn.Sequential(*layers)
+class ODEfunc(nn.Module):
+    def __init__(self, n):
+        super(ODEfunc, self).__init__()
+        self.c1 = Convxt(n, n)
+        self.c2 = Convxt(n, n)
+        self.nfe = 0
 
-    def forward(self, x):
-        bs = x.size(0)
-        x = x.unsqueeze(1)
-        x = self.layers(x)
-        x = x.view(bs, 10)
-        return x
+    def forward(self, t, x):
+        self.nfe += 1
+        x = self.c1(x)
+        x = self.c1(x)
 
-class Net2(nn.Module):
+class ODEBlock(nn.Module):
+    # https://github.com/rtqichen/torchdiffeq/blob/master/examples/odenet_mnist.py
+    pass
+
+
+#############################################################################################################################
+
+class ODENet(nn.Module):
     def __init__(self):
-        super(Net2, self).__init__()
+        super(ODENet, self).__init__()
         c = 10
         downsample = ConvResBlock(1, c)
         x = torch.randn(1, 1, 28, 28)
@@ -197,42 +153,6 @@ class Net2(nn.Module):
         x = x.view(bs, 10)
         return x
 
-class SimpleEncoder(nn.Module):
-    def __init__(self):
-        super(SimpleEncoder, self).__init__()
-        # self.szs = [28, 3]
-        # self.conv1 = Conv(in_c = 1, out_c=10, ks=5)
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=10, kernel_size=3, bias=False)
-        self.pool1 = nn.AdaptiveMaxPool2d(3)
-        self.act = nn.LeakyReLU()
-        self.fc = nn.Linear(90, 20, bias=False)
-        self.l_out = nn.Linear(20, 10, bias=False)
-
-    def forward(self, x):
-        x = x
-        bs = x.size(0)
-        x = x.unsqueeze(1)
-        x = self.act(self.conv1(x))
-        x = self.pool1(x)
-        x = x.view(bs, -1)
-        x = self.act(self.fc(x))
-        x = self.l_out(x)
-        return x
-
-class BasicEncoder(nn.Module):
-    def __init__(self):
-        super(BasicEncoder, self).__init__()
-        self.fc1 = nn.Linear(28*28, 20, bias=False)
-        self.fc2 = nn.Linear(20, 10, bias=False)
-        self.act = nn.LeakyReLU()
-
-    def forward(self, x):
-        bs = x.size(0)
-        x = x.view(bs, -1)
-        x = self.act(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
 ###########################################################################
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -245,7 +165,7 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 class BaseLearner():
     '''Training loop'''
     def __init__(self, epochs=NUM_EPOCHS):
-        self.model = Net2().to(device)
+        self.model = ODENet().to(device)
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=5e-2, weight_decay=1e-6)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10, eta_min=1e-3)
