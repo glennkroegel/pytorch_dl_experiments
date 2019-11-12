@@ -28,6 +28,8 @@ from callbacks import Hook
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 status_properties = ['loss', 'accuracy']
 
+# https://github.com/rtqichen/torchdiffeq/blob/master/examples/odenet_mnist.py
+
 class Dense(nn.Module):
     def __init__(self, in_size, out_size, bias=False):
         super(Dense, self).__init__()
@@ -40,7 +42,7 @@ class Dense(nn.Module):
 
     def forward(self, x):
         x = x.view(-1, self.in_size)
-        x = self.act(self.bn(self.fc(x)))
+        x = self.act(self.norm(self.fc(x)))
         return x
 
 class Conv(nn.Module):
@@ -72,10 +74,12 @@ class ConvResBlock(nn.Module):
         super(ConvResBlock, self).__init__()
         self.conv = Conv(in_c=in_c, out_c=out_c, stride=2)
         self.res_block = ResBlock(out_c)
+        self.pool = nn.AdaptiveMaxPool2d(4)
 
     def forward(self, x):
         x = self.conv(x)
         x = self.res_block(x)
+        x = self.pool(x)
         return x
 
 class Convxt(nn.Module):
@@ -101,14 +105,16 @@ class FeedForward(nn.Module):
     def __init__(self, in_shp):
         super(FeedForward, self).__init__()
         self.in_shp = in_shp
-        in_feats = in_shp[1]*in_shp[2]*in_shp[3]
-        self.fc = Dense(in_feats, 20)
-        self.out = nn.Linear(20, 10)
+        self.pool = nn.AdaptiveMaxPool2d(1)
+        in_feats = in_shp[1] #*in_shp[2]*in_shp[3]
+        # self.fc = Dense(in_feats, 10)
+        self.out = nn.Linear(10, 10)
 
     def forward(self, x):
         bs = x.size(0)
+        x = self.pool(x)
         x = x.view(bs, -1)
-        x = self.fc(x)
+        # x = self.fc(x)
         x = self.out(x)
         return x
 
@@ -123,12 +129,28 @@ class ODEfunc(nn.Module):
 
     def forward(self, t, x):
         self.nfe += 1
-        x = self.c1(x)
-        x = self.c1(x)
+        x = self.c1(t, x)
+        x = self.c2(t, x)
+        return x
 
 class ODEBlock(nn.Module):
-    # https://github.com/rtqichen/torchdiffeq/blob/master/examples/odenet_mnist.py
-    pass
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.FloatTensor([0, 1])
+    
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
 
 
 #############################################################################################################################
@@ -141,8 +163,9 @@ class ODENet(nn.Module):
         x = torch.randn(1, 1, 28, 28)
         x.requires_grad_(False)
         x_sz = downsample(x).shape
+        feature_layers = ODEBlock(ODEfunc(x_sz[1]))
         head = FeedForward(x_sz)
-        layers = [downsample, head]
+        layers = [downsample, feature_layers, head]
         [print(count_parameters(x)) for x in layers]
         self.layers = nn.Sequential(*layers)
 
@@ -187,8 +210,8 @@ class BaseLearner():
             model.eval()
         props = {k:0 for k in status_properties}
         for i, data in enumerate(loader):
-            if i % 100 == 0:
-                print(i)
+            # if i  == 2:
+            #     break
             x, targets = data
             targets = targets.view(-1).to(device)
             preds = model(x.to(device))

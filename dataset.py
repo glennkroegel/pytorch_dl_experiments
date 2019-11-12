@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.utils.data as data_utils
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from config import TRAIN_DATA, CV_DATA
 import os
 
 class ProcessedDataset(torch.utils.data.Dataset):
@@ -22,8 +23,8 @@ class ProcessedDataset(torch.utils.data.Dataset):
 
 class ProcessedDataLoaderFactory():
     def __init__(self):
-        self.train_data = torch.load('processed/training.pt')
-        self.cv_data = torch.load('processed/cv.pt')
+        self.train_data = torch.load(TRAIN_DATA)
+        self.cv_data = torch.load(CV_DATA)
 
     def gen(self, batch_size=256):
         train_set = ProcessedDataset(self.train_data)
