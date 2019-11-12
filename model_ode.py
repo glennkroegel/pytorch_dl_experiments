@@ -15,7 +15,6 @@ import torch.utils.data as data_utils
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 import torchvision
-from torchdiffeq import odeint
 from tqdm import tqdm
 import shutil
 
@@ -24,6 +23,12 @@ from utils import count_parameters, accuracy
 
 from config import NUM_EPOCHS
 from callbacks import Hook
+
+adjoint = True
+if adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 status_properties = ['loss', 'accuracy']
@@ -141,7 +146,7 @@ class ODEBlock(nn.Module):
     
     def forward(self, x):
         self.integration_time = self.integration_time.type_as(x)
-        out = odeint(self.odefunc, x, self.integration_time)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=1e-3, atol=1e-4)
         return out[1]
 
     @property
@@ -163,9 +168,9 @@ class ODENet(nn.Module):
         x = torch.randn(1, 1, 28, 28)
         x.requires_grad_(False)
         x_sz = downsample(x).shape
-        feature_layers = ODEBlock(ODEfunc(x_sz[1]))
+        self.feature_layers = ODEBlock(ODEfunc(x_sz[1]))
         head = FeedForward(x_sz)
-        layers = [downsample, feature_layers, head]
+        layers = [downsample, self.feature_layers, head]
         [print(count_parameters(x)) for x in layers]
         self.layers = nn.Sequential(*layers)
 
@@ -220,8 +225,12 @@ class BaseLearner():
             props['accuracy'] += accuracy(preds, targets).item()
             if training:
                 optimizer.zero_grad()
+                fe_forward = model.feature_layers.nfe
+                model.feature_layers.nfe = 0
                 loss.backward()
                 optimizer.step()
+                nfe_backward = model.feature_layers.nfe
+                model.feature_layers.nfe = 0
                 clip_grad_norm_(model.parameters(), 0.5)
             L = len(loader)
         props = {k:v/L for k,v in props.items()}
