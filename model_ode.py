@@ -79,29 +79,29 @@ class ConvResBlock(nn.Module):
         super(ConvResBlock, self).__init__()
         self.conv = Conv(in_c=in_c, out_c=out_c, stride=2)
         self.res_block = ResBlock(out_c)
-        self.pool = nn.AdaptiveMaxPool2d(4)
+        # self.pool = nn.AdaptiveMaxPool2d(4)
 
     def forward(self, x):
         x = self.conv(x)
         x = self.res_block(x)
-        x = self.pool(x)
+        # x = self.pool(x)
         return x
 
 class Convxt(nn.Module):
     def __init__(self, in_c, out_c, ks=3, stride=1, padding=1, bias=False):
         super(Convxt, self).__init__()
         self.conv = nn.Conv2d(in_channels=in_c + 1, out_channels=out_c, kernel_size=ks, stride=stride, bias=bias, padding=padding)
-        self.norm = nn.GroupNorm(min(out_c, out_c), out_c)
+        self.norm = nn.GroupNorm(out_c//2, out_c)
         self.drop = nn.Dropout(0.1)
-        self.act = nn.LeakyReLU()
+        self.act = nn.LeakyReLU(inplace=True)
         self.in_size = in_c
         self.out_size = out_c
 
     def forward(self, t, x):
+        x = self.act(self.norm(x))
         tt = torch.ones_like(x[:, :1, :, :]) * t
         xtt = torch.cat([tt, x], dim=1)
-        y = self.norm(self.conv(xtt))
-        y = self.act(y)
+        y = self.conv(xtt)
         return x
 
 #############################################################################################################################
@@ -112,14 +112,16 @@ class FeedForward(nn.Module):
         self.in_shp = in_shp
         self.pool = nn.AdaptiveMaxPool2d(1)
         in_feats = in_shp[1] #*in_shp[2]*in_shp[3]
-        # self.fc = Dense(in_feats, 10)
-        self.out = nn.Linear(10, 10)
+        self.out = nn.Linear(in_feats, 10, bias=True)
+
+        self.norm = nn.GroupNorm(in_feats//2, in_feats, affine=True)
+        self.act = nn.LeakyReLU(inplace=True)
 
     def forward(self, x):
         bs = x.size(0)
+        x = self.act(self.norm(x))
         x = self.pool(x)
         x = x.view(bs, -1)
-        # x = self.fc(x)
         x = self.out(x)
         return x
 
@@ -163,7 +165,7 @@ class ODEBlock(nn.Module):
 class ODENet(nn.Module):
     def __init__(self):
         super(ODENet, self).__init__()
-        c = 10
+        c = 64
         downsample = ConvResBlock(1, c)
         x = torch.randn(1, 1, 28, 28)
         x.requires_grad_(False)
@@ -173,6 +175,7 @@ class ODENet(nn.Module):
         layers = [downsample, self.feature_layers, head]
         [print(count_parameters(x)) for x in layers]
         self.layers = nn.Sequential(*layers)
+        print(self.layers)
 
     def forward(self, x):
         bs = x.size(0)
@@ -195,7 +198,7 @@ class BaseLearner():
     def __init__(self, epochs=NUM_EPOCHS):
         self.model = ODENet().to(device)
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=5e-2, weight_decay=1e-6)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=1e-6)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10, eta_min=1e-3)
         self.epochs = epochs
 
