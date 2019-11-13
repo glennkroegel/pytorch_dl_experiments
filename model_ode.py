@@ -102,7 +102,7 @@ class Convxt(nn.Module):
         tt = torch.ones_like(x[:, :1, :, :]) * t
         xtt = torch.cat([tt, x], dim=1)
         y = self.conv(xtt)
-        return x
+        return y
 
 #############################################################################################################################
 
